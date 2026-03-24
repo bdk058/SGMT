@@ -1,0 +1,478 @@
+import torch
+from torch import nn, einsum
+from torch.nn import functional as F
+from network.SPT import ShiftedPatchTokenization
+from network.net_utils import DropPath
+from network.vision_transformer import ViT as vision_trans
+import inspect
+from network.SPT import MultiScaleSPT
+from network.vision_transformer import MultiScaleTransformer
+
+
+import einops as ein
+import einops.layers.torch as ein_layer
+
+import numpy as np
+
+# helpers
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+def init_weights(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.xavier_normal_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+class PreNorm(nn.Module):
+    def __init__(self, num_tokens, dim, fn):
+        super().__init__()
+        self.dim = dim
+        self.num_tokens = num_tokens
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), ** kwargs)
+
+
+ 
+class FeedForward(nn.Module):
+    def __init__(self, dim, num_patches, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.num_patches = num_patches
+        
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )            
+    def forward(self, x):
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_patches, heads = 8, dim_head = 64, dropout = 0., is_LSA=False):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.num_patches = num_patches
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.dim = dim
+        self.inner_dim = inner_dim
+        self.attend = nn.Softmax(dim = -1)
+        self.to_qkv = nn.Linear(self.dim, self.inner_dim * 3, bias = False)
+        init_weights(self.to_qkv)
+        self.to_out = nn.Sequential(
+            nn.Linear(self.inner_dim, self.dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+            
+        if is_LSA:
+            self.scale = nn.Parameter(self.scale*torch.ones(heads))    
+            self.mask = torch.eye(self.num_patches+1, self.num_patches+1)
+            self.mask = torch.nonzero((self.mask == 1), as_tuple=False)
+        else:
+            self.mask = None
+
+    def forward(self, x):
+        b, n, _, h = *x.shape, self.heads
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: ein.rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
+
+        if self.mask is None:
+            dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        
+        else:
+            scale = self.scale
+            dots = torch.mul(einsum('b h i d, b h j d -> b h i j', q, k), scale.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand((b, h, 1, 1)))
+            dots[:, :, self.mask[:, 0], self.mask[:, 1]] = -987654321
+
+        attn = self.attend(dots)
+        out = einsum('b h i j, b h j d -> b h i d', attn, v) 
+            
+        out = ein.rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+    
+    def flops(self):
+        flops = 0
+        if not self.is_coord:
+            flops += self.dim * self.inner_dim * 3 * (self.num_patches+1)
+        else:
+            flops += (self.dim+2) * self.inner_dim * 3 * self.num_patches  
+            flops += self.dim * self.inner_dim * 3  
+
+
+class Transformer(nn.Module):
+    def __init__(self, dim, num_patches, depth, heads, dim_head, mlp_dim_ratio, dropout = 0., stochastic_depth=0., is_LSA=False):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        self.scale = {}
+
+        for i in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm(num_patches, dim, Attention(dim, num_patches, heads = heads, dim_head = dim_head, dropout = dropout, is_LSA=is_LSA)),
+                PreNorm(num_patches, dim, FeedForward(dim, num_patches, dim * mlp_dim_ratio, dropout = dropout))
+            ]))            
+        self.drop_path = DropPath(stochastic_depth) if stochastic_depth > 0 else nn.Identity()
+    
+    def forward(self, x):
+        for i, (attn, ff) in enumerate(self.layers):       
+            x = self.drop_path(attn(x)) + x
+            x = self.drop_path(ff(x)) + x            
+            self.scale[str(i)] = attn.fn.scale
+        return x
+
+      
+        
+class DNM(nn.Module):
+    def __init__(self,
+                 in_channel,
+                 out_channel,
+                 num_branch=5,
+                 synapse_activation="None",
+                 dendritic_activation="None",
+                 soma="None",
+                 att_temperature: float = 1.0,
+                 topk: int = None,
+                 use_proj_query: bool = False):
+        super(DNM, self).__init__()
+
+        # ----------------------
+        # helper convert string
+        # ----------------------
+        def _str_to_callable(v):
+            if v is None:
+                return None
+            if not isinstance(v, str):
+                return v
+            s = v.lower()
+            if s == "sigmoid":
+                return nn.Sigmoid()
+            if s == "relu":
+                return nn.ReLU()
+            if s == "gelu":
+                return nn.GELU()
+            if s == "softmax":
+                return nn.Softmax(dim=1)
+            if s == "none" or s == "null":
+                return None
+            return None
+
+        # Store activation functions
+        self.sa = _str_to_callable(synapse_activation)
+        self.da = _str_to_callable(dendritic_activation)
+
+        # Soma mode
+        if isinstance(soma, str):
+            s = soma.lower()
+            if s in ["none", "original"]:
+                self.soma_callable = None
+                self.soma_mode = "Original"
+            elif s in ["attentiontopk", "attentionsoma", "attention-topk"]:
+                self.soma_callable = None
+                self.soma_mode = "AttentionTopK"
+            else:
+                self.soma_mode = "Original"
+                self.soma_callable = None
+        else:
+            self.soma_mode = "Original"
+            self.soma_callable = soma if callable(soma) else None
+
+        # ------------------------
+        # Core DNM parameters
+        # ------------------------
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.nb = num_branch
+
+        self.sn0 = nn.LayerNorm(in_channel)
+        self.sw = nn.Parameter(torch.randn(out_channel, num_branch, in_channel))
+        self.sb = nn.Parameter(torch.randn(out_channel, num_branch, in_channel))
+
+        self.dn = nn.LayerNorm([num_branch, in_channel])
+        self.dl = nn.Linear(num_branch, 1)
+
+        # attention-soma extra params (if needed later)
+        self.att_temperature = att_temperature
+        self.topk = topk
+        self.use_proj_query = use_proj_query
+        self.att_topk = None  # can be attached later externally
+
+    # ----------------------------------------
+    # forward — giữ nguyên như DVT_V3 gốc
+    # ----------------------------------------
+    def forward(self, x):
+        # x: [B, in_channel]
+        x = self.sn0(x)  # norm
+
+        if len(x.shape) == 2:
+            b, _ = x.shape
+            x = ein.repeat(x, 'b d -> b o m d', o=self.out_channel, m=self.nb)
+        else:
+            b = x.shape[0]
+
+        sw = ein.repeat(self.sw, 'o m d -> b o m d', b=b)
+        sb = ein.repeat(self.sb, 'o m d -> b o m d', b=b)
+
+        x = sw * x + sb  # synapse
+        if self.sa is not None:
+            x = self.sa(x)
+
+        x = self.dn(x)
+        x = x.sum(dim=3)
+
+        if self.da is not None:
+            x = self.da(x)
+
+        # linear aggregator
+        x = self.dl(x).squeeze(2)
+
+        # Soma
+        if self.soma_mode == "Original":
+            if self.soma_callable is not None:
+                x = self.soma_callable(x)
+        elif self.soma_mode == "AttentionTopK":
+            if self.att_topk is not None:
+                x = self.att_topk(x)
+
+        return x
+
+
+        
+class DVT(nn.Module):
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError("DVT (original) has been disabled. Use DVT_V2 or DVT_V3 instead.")
+
+        
+class OriViT(nn.Module):
+    def __init__(self, config, device='cpu'):
+        super(OriViT, self).__init__()
+        
+        vit_config = config['ViT']
+        
+        
+        if config['mlp_head'] == 'original':
+            self.mlp_head = 'original'
+        elif config['mlp_head'] == 'strategy_1':
+            self.mlp_head = 'strategy_1'
+        elif config['mlp_head'] == 'strategy_2':
+            self.mlp_head = 'strategy_2'
+        elif config['mlp_head'] == 'strategy_3':
+            self.mlp_head = 'strategy_3'
+
+            
+        self.net = vision_trans(**vit_config, mlp_head=self.mlp_head).to(device)
+    
+    def str2func(self, config):
+        # sigmoid, relu, gelu, softmax
+        
+        for k, func_str in config.items():
+            if not isinstance(func_str, str):
+                continue
+            if func_str.casefold() == 'sigmoid'.casefold():
+                func_str = nn.Sigmoid()
+            elif func_str.casefold() == 'relu'.casefold():
+                func_str = nn.ReLU()
+            elif func_str.casefold() == 'gelu'.casefold():
+                func_str = nn.GELU()
+            elif func_str.casefold() == 'softmax'.casefold():
+                func_str = nn.Softmax(dim=1)
+            elif func_str.casefold() == 'none'.casefold():
+                func_str = None
+            config[k] = func_str
+        return config
+        
+    def forward(self, x):
+        return self.net(x)
+
+
+# ======================================
+# === Dynamic Vision Transformer V2 ====
+# ======================================
+
+from network.vision_transformer import ViT
+
+class DVT_V2(nn.Module):
+    def __init__(self, config, device='cpu'):
+        super(DVT_V2, self).__init__()
+        self.config = config
+        self.device = device
+
+        # === Step 1: Extract ViT configuration
+        vit_config = config['ViT']
+
+        self.image_size = vit_config.get('img_size', 32)
+        self.patch_size = vit_config.get('patch_size', 4)
+        self.num_classes = vit_config.get('num_classes', 10)
+        self.dim = vit_config.get('dim', 192)
+        self.depth = vit_config.get('depth', 9)
+        self.heads = vit_config.get('heads', 12)
+        self.dim_head = vit_config.get('dim_head', 16)
+        self.mlp_dim_ratio = vit_config.get('mlp_dim_ratio', 2)
+        self.channels = vit_config.get('channels', 3)
+        self.dropout = vit_config.get('dropout', 0.)
+        self.emb_dropout = vit_config.get('emb_dropout', 0.)
+
+        # === Step 2: Define Shifted Patch Tokenization (dynamic)
+        self.to_patch_embedding = ShiftedPatchTokenization(
+            in_dim=self.channels,
+            dim=self.dim,
+            patch_size=self.patch_size,
+            exist_class_t=False
+        )
+
+        # === Step 3: Define Vision Transformer backbone
+# assume vit_config = config['ViT'] already read above
+# resolve optional soma fields (allow from vit_config or from top-level network config)
+        use_soma = bool(vit_config.get('use_soma', False))
+        soma_topk = vit_config.get('soma_topk', None)
+        soma_proj_query = bool(vit_config.get('soma_proj_query', True))
+        soma_proj_hidden = vit_config.get('soma_proj_hidden', max(16, self.dim // 8))
+        soma_temperature = float(vit_config.get('soma_temperature', 1.0))
+
+        self.transformer = ViT(
+            image_size=self.image_size,     # ViT unified accepts image_size keyword
+            patch_size=self.patch_size,
+            num_classes=self.num_classes,
+            dim=self.dim,
+            depth=self.depth,
+            heads=self.heads,
+            mlp_dim_ratio=self.mlp_dim_ratio,
+            dim_head=self.dim_head,
+            channels=self.channels,
+            dropout=self.dropout,
+            emb_dropout=self.emb_dropout,
+            use_soma=use_soma,
+            soma_topk=soma_topk,
+            soma_proj_query=soma_proj_query,
+            soma_proj_hidden=soma_proj_hidden,
+            soma_temperature=soma_temperature
+        )
+
+
+        # === Step 4: Device placement
+        self.to(self.device)
+
+        print(f"[DVT_V2] Initialized — supports dynamic input size, dim={self.dim}, depth={self.depth}, patch={self.patch_size}")
+
+    def forward(self, x):
+        """
+        Forward pass (supports variable input sizes)
+        --------------------------------------------
+        Args:
+            x : Tensor [B, C, H, W] — arbitrary spatial resolution
+        Returns:
+            logits : Tensor [B, num_classes]
+        """
+        B, C, H, W = x.shape
+        tokens = self.to_patch_embedding(x)
+        out = self.transformer(tokens, H=H, W=W)
+        return out
+
+
+def instantiate_dnm_safe(dnm_cfg):
+    """
+    Create DNM while filtering keys that DNM.__init__ does not accept.
+    This prevents TypeError when config contains transformer-soma keys like topk/att_temperature.
+    """
+    # if DNM not defined in current scope, import it safely
+    global DNM
+    # DNM should be present in this module (defined earlier). If not, import:
+    try:
+        _ = DNM
+    except NameError:
+        from network.network import DNM as DNM  # fallback
+    sig = inspect.signature(DNM.__init__)
+    valid = {k for k in sig.parameters.keys() if k != 'self'}
+    filtered = {k: v for k, v in dnm_cfg.items() if k in valid}
+    return DNM(**filtered)
+
+class DVT_V4(nn.Module):
+    """
+    DVT_V4 = DVT_V3 + multiscale (patch sizes base, base*2, base*4)
+    - Uses MultiScaleSPT to produce tokens at 3 scales
+    - Uses MultiScaleTransformer to process and fuse scales -> produces [B, D] features
+    - Head: DNM (safe instantiate) or original mlp head
+    """
+    def __init__(self, config, device='cpu'):
+        super(DVT_V4, self).__init__()
+        self.config = config
+        self.device = device
+
+        vit_cfg = config.get('ViT', {})
+        base_patch = int(vit_cfg.get('patch_size', 4))
+        dim = int(vit_cfg.get('dim', 192))
+        depth = int(vit_cfg.get('depth', 9))
+        heads = int(vit_cfg.get('heads', 12))
+        dim_head = int(vit_cfg.get('dim_head', max(16, dim // heads)))
+        mlp_dim = int(dim * vit_cfg.get('mlp_dim_ratio', 2))
+        channels = int(vit_cfg.get('channels', 3))
+
+        # Multi-scale SPT
+        self.to_patch_embedding = MultiScaleSPT(in_dim=channels, dim=dim, base_patch=base_patch, exist_class_t=False)
+
+        # MultiScaleTransformer
+        self.multiscale_transformer = MultiScaleTransformer(dim=dim,
+                                                            depth=depth,
+                                                            heads=heads,
+                                                            dim_head=dim_head,
+                                                            mlp_dim=mlp_dim,
+                                                            use_soma=bool(vit_cfg.get('use_soma', False)),
+                                                            soma_topk=vit_cfg.get('soma_topk', None),
+                                                            soma_proj_query=vit_cfg.get('soma_proj_query', True),
+                                                            soma_proj_hidden=vit_cfg.get('soma_proj_hidden', None),
+                                                            soma_temperature=vit_cfg.get('soma_temperature', 1.0))
+
+        # final head: DNM or linear
+        mlp_head_type = config.get('mlp_head', 'original')
+        if mlp_head_type == 'dnm':
+            dnm_cfg = config.get('dnm', {})
+            self.head = instantiate_dnm_safe(dnm_cfg)
+        else:
+            self.head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, vit_cfg.get('num_classes', 10)))
+
+        self.to(device)
+
+    def forward(self, x):
+        # input x: [B,C,H,W]
+        B, C, H, W = x.shape
+        tokens = self.to_patch_embedding(x)                  # dict with 'high','mid','low'
+        feat = self.multiscale_transformer(tokens, H=H, W=W) # [B, D]
+        out = self.head(feat)                                # if DNM, it will accept [B,D] or expand as needed
+        return out
+
+
+def get_network(cfg):
+    """
+    Factory function to build the network model based on config['name'].
+    This keeps the training/testing pipeline modular and expandable.
+    """
+    name = cfg['name']
+
+    if name == 'DVT':
+        from network.vision_transformer import DVT
+        return DVT(cfg['ViT'])
+
+    elif name == 'DVT_V2':
+        from network.vision_transformer import DVT_V2
+        return DVT_V2(cfg['ViT'])
+
+    elif name == 'DVT_NaViT':
+        from network.vision_transformer import DVT_NaViT
+        return DVT_NaViT(cfg['ViT'])
+    
+    elif name == 'DVT_V4':
+        from network.network import DVT_V4
+        return DVT_V4(cfg)
+
+    else:
+        raise ValueError(f"[Error] Unknown network name: {name}")
+     
