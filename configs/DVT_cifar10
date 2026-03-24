@@ -1,0 +1,82 @@
+{
+    "data_params": {
+        "data_root": "/home/zhangzm/DataSet/CIFAR",
+        "cifar_type": "CIFAR10",
+        "batch_size": 128,
+        "img_size": [32, 32],
+        "norm": [[0.5070, 0.4865, 0.4409], [0.2673, 0.2564, 0.2762]],
+        "valid_scale": 0.1,
+        "multi_process": 2,
+        "num_classes": 10,
+        "augmentation": {
+            "aug_policy": "CIFAR",
+            "random_erasing": {
+                "prob": 0.25,
+                "sh": 0.4,
+                "r1": 0.3
+            },
+            "repeat_aug": 3
+        }
+    },
+
+      "network_params": {
+        "name": "DVT_V2",
+        "ViT": {
+          "image_size": [32, 32],       
+          "patch_size": 4,
+          "num_classes": 10,
+          "dim": 192,
+          "depth": 9,
+          "heads": 12,
+          "mlp_dim_ratio": 2,
+          "dim_head": 16,
+          "dropout": 0.0,
+          "emb_dropout": 0.0,
+          "use_soma": true,
+          "soma_topk": 32,
+          "soma_proj_query": true,
+          "soma_proj_hidden": 24,
+          "soma_temperature": 1.0
+        },
+        "dnm": {
+            "in_channel": 192,
+            "out_channel": 10,
+            "num_branch": 8,
+            "synapse_activation": "None",
+            "dendritic_activation": "None",
+            "soma": "AttentionTopK",
+            "att_temperature": 0.5,
+            "topk": 3,
+            "use_proj_query": true
+        },
+        "mlp_head": "dnm"
+    },
+
+    "log_params": {
+        "log_root": "/content/DVT/logs"
+    },
+
+    "train_params": {
+        "learning_rate": 0.003,
+        "optimizer": "AdamW",
+        "opt_args": {
+            "weight_decay": 0.05
+        },
+        "lr_scheduler": {
+            "type": "cosine",
+            "warmup": 10
+        },
+        "loss": "CE",
+        "epoch": 100,
+        "save_mode": "max",
+        "report_metrics": [
+            "Acc-k1",
+            "Acc-k3",
+            "Pre",
+            "Recall",
+            "F1",
+            "AUC"
+        ],
+        "report_format": "Epoch: {} -- Loss: {:.4}/{:.4} -- Acc: {:.1%}/{:.1%} -- AUC: {:.1%}/{:.1%} -- Time: {}"
+    }
+}
