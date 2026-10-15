@@ -1,0 +1,165 @@
+import torch
+import torch.optim as optim
+import time, os, csv
+import numpy as np
+from tqdm import tqdm
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = SGMT(
+    num_classes=100,
+    dim=256,
+    depth=12,
+    heads=12,
+    dim_head=16,
+    mlp_ratio=2,
+    use_conv_stem=True,
+    use_soma=True,
+    soma_topk=32,
+    fusion_depth=2,
+    head_type="dnm"
+).to(device)
+
+optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-2)
+EPOCHS = 100
+warmup_epochs = 5
+
+scheduler = SequentialLR(
+    optimizer,
+    schedulers=[
+        LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
+        CosineAnnealingLR(optimizer, T_max=EPOCHS - warmup_epochs)
+    ],
+    milestones=[warmup_epochs]
+)
+criterion = torch.nn.CrossEntropyLoss()
+                
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.shadow = {}
+        self.backup = {}
+        self.decay = decay
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = (
+                    (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                )
+
+    def apply_shadow(self):
+        self.backup = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict
+ema = EMA(model)
+
+def mixup_data(x, y, alpha=0.2):
+    lam = np.random.beta(alpha, alpha)
+    index = torch.randperm(x.size(0)).to(x.device)
+    return lam * x + (1 - lam) * x[index], y, y[index], lam
+
+def accuracy(output, target, topk=(1,5)):
+    maxk = max(topk)
+    _, pred = output.topk(maxk, 1, True, True)
+    correct = pred.eq(target.view(-1,1).expand_as(pred))
+    return [(correct[:, :k].reshape(-1).float().sum(0) / target.size(0)) for k in topk]
+
+SAVE_DIR = "/content/drive/MyDrive/SGMT_cifar100_no_DNM_checkpoint"
+os.makedirs(SAVE_DIR, exist_ok=True)
+ckpt_path = os.path.join(SAVE_DIR, "last.pth")
+best_path = os.path.join(SAVE_DIR, "best.pth")
+log_path = os.path.join(SAVE_DIR, "training_log.csv")
+            
+start_epoch = 0
+best_acc = 0
+
+if os.path.exists(ckpt_path):
+    ckpt = torch.load(ckpt_path)
+
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optim"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        if "ema" in ckpt:
+            ema.load_state_dict(ckpt["ema"])
+            print("EMA loaded")
+        start_epoch = ckpt["epoch"]
+        best_acc = ckpt.get("best_acc", 0)
+        print(f"Resume from epoch {start_epoch}")
+    else:
+        model.load_state_dict(ckpt)
+        print("Loaded legacy checkpoint")
+else:
+    print("Training from scratch")
+
+if not os.path.exists(log_path):
+    with open(log_path, "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch","train_loss","val_acc1","val_acc5","lr","time_s"])
+
+for epoch in range(start_epoch, EPOCHS):
+    t0 = time.time()
+    model.train()
+    total_loss = 0
+    for x, y in tqdm(train_loader):
+        x, y = x.to(device), y.to(device)
+        x, y_a, y_b, lam = mixup_data(x, y)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = lam * criterion(out, y_a) + (1 - lam) * criterion(out, y_b)
+        loss.backward()
+        optimizer.step()
+        ema.update()
+        total_loss += loss.item()
+    train_loss = total_loss / len(train_loader)
+    ema.apply_shadow()
+    model.eval()
+    acc1 = acc5 = 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            a1, a5 = accuracy(out, y)
+            acc1 += a1.item()
+            acc5 += a5.item()
+
+    acc1 /= len(test_loader)
+    acc5 /= len(test_loader)
+    ema.restore()
+    lr = optimizer.param_groups[0]['lr']
+    t = time.time() - t0
+    print(f"Epoch {epoch+1:03d} | Loss {train_loss:.2f} | Acc@1 {acc1*100:.2f}% | Acc@5 {acc5*100:.2f}% | LR {lr:.6f}")
+    with open(log_path, "a") as f:
+        writer = csv.writer(f)
+        writer.writerow([epoch+1, round(train_loss,2), round(acc1*100,2), round(acc5*100,2), round(lr,8), round(t,2)])
+
+    torch.save({
+        "model": model.state_dict(),
+        "optim": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "ema": ema.state_dict(),
+        "epoch": epoch+1,
+        "best_acc": best_acc
+    }, ckpt_path)
+    if acc1 > best_acc:
+        best_acc = acc1
+        torch.save(model.state_dict(), best_path)
+    scheduler.step()
