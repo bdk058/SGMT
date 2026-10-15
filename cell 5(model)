@@ -1,0 +1,67 @@
+import torch
+from torch import nn
+
+class SGMT(nn.Module):
+    def __init__(self,
+                 num_classes=100,
+                 dim=256,
+                 depth=12,
+                 heads=12,
+                 dim_head=16,
+                 mlp_ratio=2,
+                 base_patch=4,
+                 use_conv_stem=True,
+                 use_soma=True,
+                 soma_topk=32,
+                 fusion_depth=2,
+                 head_type="dnm",
+                 num_branch=8,
+                 branch_hidden=128,
+                 head_dropout=0.1):
+        super().__init__()
+        self.spt = MultiScaleSPT(
+            in_dim=3,
+            dim=dim,
+            base_patch=base_patch,
+            exist_class_t=False,
+            use_conv_stem=use_conv_stem
+        )
+        self.transformer = MultiScaleTransformer(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=dim * mlp_ratio,
+            dropout=0.,
+            use_soma=use_soma,
+            soma_topk=soma_topk,
+            soma_proj_query=True,
+            soma_proj_hidden=None,
+            soma_temperature=1.0,
+            pool='cls',
+            fusion_depth=fusion_depth
+        )
+        self.head_type = head_type
+        if head_type == "dnm":
+            self.head = DNM(
+                in_channel=dim,
+                out_channel=num_classes,
+                num_branch=num_branch,
+                branch_hidden=branch_hidden,
+                dropout=head_dropout
+            )
+        elif head_type == "linear":
+            self.head = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim,num_classes)
+            )
+        else:
+            raise ValueError(
+                f"Unknown head_type: {head_type}"
+            )
+
+    def forward(self, x):
+        tokens = self.spt(x)
+        feat = self.transformer(tokens,H=x.shape[2],W=x.shape[3])
+        out = self.head(feat)
+        return out
