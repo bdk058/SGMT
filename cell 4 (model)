@@ -1,0 +1,168 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+from einops import repeat
+
+class CrossScaleAttention(nn.Module):
+    def __init__(self,
+                 dim,
+                 heads=8,
+                 dim_head=64,
+                 dropout=0.,
+                 use_soma=False,
+                 soma_topk=None,
+                 soma_proj_query=True,
+                 soma_proj_hidden=None,
+                 soma_temperature=1.0):
+        super().__init__()
+
+        self.attn = Attention(
+            dim=dim,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout,
+            use_soma=use_soma,
+            soma_topk=soma_topk,
+            soma_proj_query=soma_proj_query,
+            soma_proj_hidden=soma_proj_hidden,
+            soma_temperature=soma_temperature
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return x + self.attn(
+            self.norm(x)
+        )
+
+class MultiScaleTransformer(nn.Module):
+    def __init__(self,
+                 dim,
+                 depth,
+                 heads,
+                 dim_head,
+                 mlp_dim,
+                 dropout=0.,
+                 use_soma=False,
+                 soma_topk=None,
+                 soma_proj_query=True,
+                 soma_proj_hidden=None,
+                 soma_temperature=1.0,
+                 pool='cls',
+                 max_tokens=4096,
+                 fusion_depth=2):
+        super().__init__()
+
+        self.pool = pool
+        self.dim = dim
+        self.fusion_depth = fusion_depth
+        self.shared_transform = Transformer(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            drop_path=0.1,
+            use_soma=use_soma,
+            soma_topk=soma_topk,
+            soma_proj_query=soma_proj_query,
+            soma_proj_hidden=soma_proj_hidden,
+            soma_temperature=soma_temperature
+        )
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_tokens, dim) * 0.02)
+        self.cross_attn_blocks = nn.ModuleList([
+            CrossScaleAttention(
+                dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                dropout=dropout,
+                use_soma=use_soma,
+                soma_topk=soma_topk,
+                soma_proj_query=soma_proj_query,
+                soma_proj_hidden=soma_proj_hidden,
+                soma_temperature=soma_temperature
+            )
+            for _ in range(fusion_depth)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.final_norm = nn.LayerNorm(dim)
+
+    def forward(self, tokens_dict, H=None, W=None):
+        th = self.shared_transform(tokens_dict['high'])
+        tm = self.shared_transform(tokens_dict['mid'])
+        tl = self.shared_transform(tokens_dict['low'])
+        fused = torch.cat([th, tm, tl], dim=1)
+
+        if self.fusion_depth == 0:
+            fused = self.final_norm(fused)
+            if self.pool == 'mean':
+                return fused.mean(dim=1)
+            return fused.mean(dim=1)
+        B, N, D = fused.shape
+        cls = repeat(
+            self.cls_token,
+            '1 1 d -> b 1 d',
+            b=B
+        )
+        x = torch.cat([cls, fused], dim=1)
+        x = x + self.pos_embedding[:, :x.shape[1]
+        ]
+        x = self.dropout(x)
+        for block in self.cross_attn_blocks:
+            x = block(x)
+        x = self.final_norm(x)
+
+        if self.pool == 'mean':
+            return x.mean(dim=1)
+        return x[:, 0]
+
+class DNM(nn.Module):
+    def __init__(self, in_channel, out_channel, num_branch=8, branch_hidden=64, dropout=0.1):
+        super().__init__()
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.num_branch = num_branch
+        self.input_norm = nn.LayerNorm(in_channel)
+        self.branch_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_channel,branch_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(branch_hidden,in_channel),
+                nn.GELU()
+            )
+            for _ in range(num_branch)
+        ])
+        self.branch_attn = nn.Sequential(
+            nn.Linear(in_channel,in_channel // 4),
+            nn.GELU(),
+            nn.Linear(in_channel // 4, 1)
+        )
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(in_channel),
+            nn.Linear(in_channel,in_channel),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.res_gate = nn.Parameter(torch.tensor(0.5))
+        self.head = nn.Sequential(
+            nn.LayerNorm(in_channel),
+            nn.Linear(in_channel,out_channel)
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.input_norm(x)
+        branches = []
+        for branch in self.branch_proj:
+            branches.append(branch(x))
+        branches = torch.stack(branches,dim=1)
+        attn = self.branch_attn(branches)
+        attn = torch.softmax(attn,dim=1)
+        x = (branches * attn).sum(dim=1)
+        x = self.fusion(x)
+        x = x + self.res_gate * residual
+        out = self.head(x)
+        return out
